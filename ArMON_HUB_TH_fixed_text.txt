@@ -142,6 +142,16 @@ function GetQuestTitle()
 	return nil
 end
 local _rawHasQuest = function()
+	-- ใช้ข้อมูลเควสจริงของเกม (GuideModule) เป็นหลัก ไม่พึ่ง UI อย่างเดียว
+	-- (UI ที่ซ่อน/ย่อ/ยังไม่โหลด ทำให้เดิมคิดว่า "ไม่มีเควส" แล้วไปรับเควสทับซ้ำจนสลับเควสผิดไปมา)
+	local okG, hasData = pcall(function()
+		local gm = game:GetService("ReplicatedStorage"):FindFirstChild("GuideModule")
+		local G = gm and require(gm)
+		return G ~= nil and G.Data ~= nil and G.Data.QuestData ~= nil
+	end)
+	if okG and hasData then
+		return true
+	end
 	return GetQuestTitle() ~= nil
 end
 local _questSeenUntil = 0
@@ -8648,7 +8658,32 @@ local m = {
 }
 function AttackAOE(Q, d)
 	local I, _, o, V, N = {}, {}, getgenv().getBladeHits, t.Character, { t.Character.HumanoidRootPart }
-	for y, P in o(V, N, Q or 80, d) do
+	-- ขยายฮิตบ็อกซ์ของมอนในกลุ่มชั่วขณะ "ตอนคำนวณเป้าหมายตี" เท่านั้น แล้วคืนขนาดทันที (ไม่มีการรอ)
+	-- ขนาดจึงไม่ค้างตอนมอนตาย เอฟเฟกต์ตายของเกมเลยไม่บวมใหญ่
+	local saved = {}
+	local G2 = getgenv().__BringSlots
+	if G2 and G2.slots then
+		for i = 1, 3 do
+			local mb = G2.slots[i]
+			local hr = mb and mb.Parent and mb:FindFirstChild("HumanoidRootPart")
+			if hr and hr.Size.X < 30 then
+				saved[hr] = hr.Size
+				pcall(function()
+					hr.Size = Vector3.new(30, hr.Size.Y, 30)
+				end)
+			end
+		end
+	end
+	local okHits, hits = pcall(o, V, N, Q or 80, d)
+	for hr, sz in pairs(saved) do
+		pcall(function()
+			hr.Size = sz
+		end)
+	end
+	if not okHits or type(hits) ~= "table" then
+		hits = {}
+	end
+	for y, P in hits do
 		y = G:GetRigOfHitPart(P)
 		if y and not _[y] and m[P.Name] and (G:IsVulnerable(y)) then
 			local m, Q = y:FindFirstChild("Summoner"), t.Character:FindFirstChild("Summoner")
@@ -9107,7 +9142,7 @@ end
 -- ===== BringMob v3: รวบมอน 3 ตัวพอดี วางแยกช่องไม่ซ้อน + ตัวตายดึงตัวชนิดเดียวกันมาแทนช่องเดิม =====
 -- ใช้ร่วมกับทุกระบบฟาร์มที่เรียก BringMob(มอนเป้าหมาย) (ฟาร์มเลเวล/มาสเตอรี/วัสดุ/บอน ฯลฯ)
 function BringMob(Q)
-	local COUNT, RADIUS, RANGE, STUCK, HITBOX = 3, 4.5, 300, 3, 30
+	local COUNT, RADIUS, RANGE, STUCK = 3, 4.5, 300, 3
 	if Settings["Bring Mob"] == false then
 		return
 	end
@@ -9269,13 +9304,6 @@ function BringMob(Q)
 			end
 			sizepart(mob)
 			local hrp = mob.HumanoidRootPart
-			-- ขยายฮิตบ็อกซ์ (เฉพาะแกน X/Z ฝั่งเรา ไม่เห็นด้วยตา) ให้ตีโดนไกลขึ้น
-			if not S.orig[mob] then
-				S.orig[mob] = hrp.Size
-			end
-			if hrp.Size.X < HITBOX then
-				hrp.Size = Vector3.new(HITBOX, S.orig[mob].Y, HITBOX)
-			end
 			hrp.CanCollide = false
 			local ang = (2 * math.pi / COUNT) * (i - 1)
 			local slot = l * CFrame.new(math.cos(ang) * RADIUS, 0, math.sin(ang) * RADIUS)
@@ -9919,6 +9947,13 @@ local function B(C)
 end
 
 TakeQuestLevel = function()
+	-- ถ้าถือเควสอยู่แล้ว (ตามข้อมูลจริงของเกม) ห้ามรับเควสทับ
+	local okHeld, held = pcall(function()
+		return DontQuest()
+	end)
+	if okHeld and held then
+		return
+	end
 	local V = B(t.Data.Level.Value)
 	if getgenv().DebugFarmLevel then
 		print(("[TakeQuestLevel] Level=%s Found=%s Pos=%s Mob=%s QuestName=%s"):format(
@@ -10386,6 +10421,79 @@ function SpecialHop(C)
 		end
 	end
 end
+-- ===== ฟาร์มเลเวล (เฉพาะโหมดนี้): เลือกเควสที่ใกล้เลเวลตัวละครที่สุด + ถ้ารับผิดให้ยกเลิกแล้วรับใหม่ =====
+local _lvAbandonAt, _lvTakeAt = 0, 0
+local function LvQuestBest()
+	local ok, res = pcall(function()
+		local RS = game:GetService("ReplicatedStorage")
+		local Quests = require(RS:WaitForChild("Quests"))
+		local G = require(RS:WaitForChild("GuideModule"))
+		local lp = game:GetService("Players").LocalPlayer
+		local lvl = lp.Data.Level.Value
+		local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+		local skip = { BartiloQuest = true, Trainees = true, MarineQuest = true, CitizenQuest = true }
+		local best
+		for _, npc in pairs(G.Data.NPCList) do
+			local qn = npc.InternalQuestName
+			if not skip[qn] and Quests[qn] then
+				for id, req in pairs(npc.Levels) do
+					local q = Quests[qn][id]
+					if q and q.Task and req <= lvl then
+						local mob, cnt = next(q.Task)
+						if mob and cnt and cnt > 1 then
+							local pos = typeof(npc.Position) == "CFrame" and npc.Position.Position or npc.Position
+							local dist = hrp and (pos - hrp.Position).Magnitude or 0
+							-- ใกล้เลเวลที่สุด (เลเวลเควสสูงสุดที่ไม่เกินเลเวลเรา) เท่ากันเลือกอันที่อยู่ใกล้ตัวที่สุด
+							if not best or req > best.Level or (req == best.Level and dist < best.Dist) then
+								best = {
+									Level = req,
+									Dist = dist,
+									QuestName = qn,
+									Id = id,
+									Mob = mob,
+									Pos = pos,
+								}
+							end
+						end
+					end
+				end
+			end
+		end
+		return best
+	end)
+	if ok then
+		return res
+	end
+end
+-- Task ของเควสที่ถืออยู่จริงตามข้อมูลเกม (nil = ไม่มีเควส)
+local function LvHeldTask()
+	local ok, task_ = pcall(function()
+		local G = require(game:GetService("ReplicatedStorage"):WaitForChild("GuideModule"))
+		local qd = G.Data and G.Data.QuestData
+		return qd and qd.Task
+	end)
+	if ok then
+		return task_
+	end
+end
+local function LvTakeQuest(best)
+	local lp = game:GetService("Players").LocalPlayer
+	local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+	local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+	if not hrp or not hum then
+		return
+	end
+	if (best.Pos - hrp.Position).Magnitude <= 8 and hum.Health > 0 then
+		if tick() - _lvTakeAt > 3 then
+			_lvTakeAt = tick()
+			task.wait(0.5)
+			CommF:InvokeServer("StartQuest", tostring(best.QuestName), best.Id)
+		end
+	else
+		toTarget(CFrame.new(best.Pos) * CFrame.new(0, 4, 2), true)
+	end
+end
+
 function FarmMethod()
 	local f, V, H = Settings["Select Method Farm"]
 	local C, J = 9999, 2
@@ -10408,7 +10516,36 @@ function FarmMethod()
 			return
 		end
 	end
-	f = V or (GetNameDoubleQuest()) or (GetLevelQuestMob and GetLevelQuestMob()) or ""
+	-- ฟาร์มเลเวลล้วนๆ เท่านั้น (ไม่ใช่ Katakuri/Bones/Tyrant/Aura/Material)
+	local lvMethod = Settings["Select Method Farm"]
+	local lvOnly = V == nil
+		and not Settings["Farm Material"]
+		and lvMethod ~= "Farm Katakuri"
+		and lvMethod ~= "Farm Bones"
+		and lvMethod ~= "Farm Tyrant of the Skies"
+		and lvMethod ~= "Aura Farm"
+	local lvBest = lvOnly and LvQuestBest() or nil
+	if lvBest then
+		local held = LvHeldTask()
+		if held and held[lvBest.Mob] == nil then
+			-- รับเควสผิด (ไม่ใช่เควสที่ใกล้เลเวลเราที่สุด) -> ยกเลิก แล้วรอบถัดไปรับเควสที่ถูก
+			if tick() - _lvAbandonAt > 4 then
+				_lvAbandonAt = tick()
+				pcall(function()
+					CommF:InvokeServer("AbandonQuest")
+				end)
+				_questSeenUntil = 0
+				task.wait(0.6)
+			end
+			return
+		elseif not held and not HasQuest() then
+			LvTakeQuest(lvBest)
+			return
+		end
+		f = lvBest.Mob
+	else
+		f = V or (GetNameDoubleQuest()) or (GetLevelQuestMob and GetLevelQuestMob()) or ""
+	end
 	if getgenv().DebugFarmLevel then
 		print(("[FarmMethod] HasQuest=%s f=%s"):format(tostring(HasQuest()), tostring(f)))
 	end
